@@ -65,7 +65,10 @@ private:
     int                    mUmsSharingCount;
     int                    mSavedDirtyRatio;
     int                    mUmsDirtyRatio;
+    int                    mSavedDirtybackgroudRatio;
+    int                    mUmsDirtybackgroudRatio;
     int                    mVolManagerDisabled;
+    int                    mlun;
 
 public:
     virtual ~VolumeManager();

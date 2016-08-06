@@ -174,9 +174,12 @@ VolumeManager::VolumeManager() {
     mBroadcaster = NULL;
     mUmsSharingCount = 0;
     mSavedDirtyRatio = -1;
-    // set dirty ratio to 0 when UMS is active
-    mUmsDirtyRatio = 0;
+    mSavedDirtybackgroudRatio = -1;
+    // set dirty ratio to 5 when UMS is active
+    mUmsDirtyRatio = 5;
+    mUmsDirtybackgroudRatio = 1;
     mVolManagerDisabled = 0;
+    mlun =0;
 }
 
 VolumeManager::~VolumeManager() {
@@ -245,6 +248,7 @@ void VolumeManager::handleBlockEvent(NetlinkEvent *evt) {
     bool hit = false;
     for (it = mVolumes->begin(); it != mVolumes->end(); ++it) {
         if (!(*it)->handleBlockEvent(evt)) {
+#define NETLINK_DEBUG 1
 #ifdef NETLINK_DEBUG
             SLOGD("Device '%s' event handled by volume %s\n", devpath, (*it)->getLabel());
 #endif
@@ -1533,6 +1537,7 @@ int VolumeManager::shareEnabled(const char *label, const char *method, bool *ena
 
 int VolumeManager::shareVolume(const char *label, const char *method) {
     Volume *v = lookupVolume(label);
+    int part = 0;
 
     if (!v) {
         errno = ENOENT;
@@ -1572,30 +1577,10 @@ int VolumeManager::shareVolume(const char *label, const char *method) {
         return -1;
     }
 
-    int fd;
-    char nodepath[255];
-    int written = snprintf(nodepath,
-             sizeof(nodepath), "/dev/block/vold/%d:%d",
-             major(d), minor(d));
+    part=v->shareVol(mlun);
+    mlun += part;
+    SLOGI("shareVolume: mlun = %d", mlun);
 
-    if ((written < 0) || (size_t(written) >= sizeof(nodepath))) {
-        SLOGE("shareVolume failed: couldn't construct nodepath");
-        return -1;
-    }
-
-    if ((fd = open(MASS_STORAGE_FILE_PATH, O_WRONLY)) < 0) {
-        SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
-        return -1;
-    }
-
-    if (write(fd, nodepath, strlen(nodepath)) < 0) {
-        SLOGE("Unable to write to ums lunfile (%s)", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    v->handleVolumeShared();
     if (mUmsSharingCount++ == 0) {
         FILE* fp;
         mSavedDirtyRatio = -1; // in case we fail
@@ -1610,12 +1595,25 @@ int VolumeManager::shareVolume(const char *label, const char *method) {
         } else {
             SLOGE("Failed to open /proc/sys/vm/dirty_ratio (%s)", strerror(errno));
         }
+        mSavedDirtybackgroudRatio = -1; // in case we fail
+        if ((fp = fopen("/proc/sys/vm/dirty_background_ratio", "r+"))) {
+            char line[16];
+            if (fgets(line, sizeof(line), fp) && sscanf(line, "%d", &mSavedDirtybackgroudRatio)) {
+                fprintf(fp, "%d\n", mUmsDirtybackgroudRatio);
+            } else {
+                SLOGE("Failed to read dirty_background_ratio (%s)", strerror(errno));
+            }
+            fclose(fp);
+        } else {
+            SLOGE("Failed to open /proc/sys/vm/dirty_background_ratio (%s)", strerror(errno));
+        }
     }
     return 0;
 }
 
 int VolumeManager::unshareVolume(const char *label, const char *method) {
     Volume *v = lookupVolume(label);
+    int part = 0;
 
     if (!v) {
         errno = ENOENT;
@@ -1632,21 +1630,10 @@ int VolumeManager::unshareVolume(const char *label, const char *method) {
         return -1;
     }
 
-    int fd;
-    if ((fd = open(MASS_STORAGE_FILE_PATH, O_WRONLY)) < 0) {
-        SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
-        return -1;
-    }
+    part=v->unshareVol();
+    mlun -= part;
+    SLOGI("unshareVolume: lun = %d", mlun);
 
-    char ch = 0;
-    if (write(fd, &ch, 1) < 0) {
-        SLOGE("Unable to write to ums lunfile (%s)", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    v->handleVolumeUnshared();
     if (--mUmsSharingCount == 0 && mSavedDirtyRatio != -1) {
         FILE* fp;
         if ((fp = fopen("/proc/sys/vm/dirty_ratio", "r+"))) {
@@ -1656,6 +1643,16 @@ int VolumeManager::unshareVolume(const char *label, const char *method) {
             SLOGE("Failed to open /proc/sys/vm/dirty_ratio (%s)", strerror(errno));
         }
         mSavedDirtyRatio = -1;
+    }
+    if (mUmsSharingCount == 0 && mSavedDirtybackgroudRatio != -1) {
+        FILE* fp;
+        if ((fp = fopen("/proc/sys/vm/dirty_background_ratio", "r+"))) {
+            fprintf(fp, "%d\n", mSavedDirtybackgroudRatio);
+            fclose(fp);
+        } else {
+            SLOGE("Failed to open /proc/sys/vm/dirty_background_ratio (%s)", strerror(errno));
+        }
+        mSavedDirtybackgroudRatio = -1;
     }
     return 0;
 }
@@ -1832,7 +1829,12 @@ bool VolumeManager::isMountpointMounted(const char *mp)
 }
 
 int VolumeManager::cleanupAsec(Volume *v, bool force) {
-    int rc = 0;
+    /* Only EXTERNAL_STORAGE needs ASEC cleanup. */
+    const char *externalPath = getenv("EXTERNAL_STORAGE") ?: "/mnt/sdcard";
+    if (0 != strcmp(v->getMountpoint(), externalPath))
+        return 0;
+
+    int rc = unmountAllAsecsInDir(Volume::SEC_ASECDIR_EXT);
 
     char asecFileName[255];
 

@@ -18,6 +18,7 @@
 #define _DEVICEVOLUME_H
 
 #include <utils/List.h>
+#include <cutils/properties.h>
 
 #include "Volume.h"
 
@@ -50,8 +51,18 @@ protected:
     int            mOrigDiskMinor;
     int            mOrigPartMinors[MAX_PARTITIONS];
     int            mDiskNumParts;
+    int            mPartsEventCnt;
+    int            mOemPartMajor;
+    int            mOemPartMinor;
     int            mPendingPartCount;
     int            mIsDecrypted;
+    int            mPartsChangeFlag;
+    // for adjusting nr_requests and max_sectors_kb in /sys/block/<DEV>/queue/ when UMS is active
+    int            mDiskSharingCount;
+    int            mSavedNrRequests;
+    int            mDiskNrRequests;
+    int            mSavedMaxSectorsKb;
+    int            mDiskMaxSectorsKb;
 
 public:
     DirectVolume(VolumeManager *vm, const fstab_rec* rec, int flags);

@@ -21,6 +21,9 @@
 #include <fnmatch.h>
 
 #include <linux/kdev_t.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define LOG_TAG "DirectVolume"
 
@@ -76,10 +79,22 @@ DirectVolume::DirectVolume(VolumeManager *vm, const fstab_rec* rec, int flags) :
     for (int i = 0; i < MAX_PARTITIONS; i++)
         mPartMinors[i] = -1;
     mPendingPartCount = 0;
-    mDiskMajor = -1;
-    mDiskMinor = -1;
+    mDiskMajor = 0;
+    mDiskMinor = 0;
+    mOrigDiskMajor = -1;
+    mOrigDiskMinor = -1;
     mDiskNumParts = 0;
+    mOemPartMajor = -1;
+    mOemPartMinor = -1;
+    mPartsEventCnt = 0;
     mIsDecrypted = 0;
+    mDiskSharingCount = 0;
+    mSavedNrRequests = -1;
+    mSavedMaxSectorsKb = -1;
+    // set nr_requests to 32 when UMS is active
+    mDiskNrRequests = 32;
+    // set max_sectors_kb to 64 when UMS is active
+    mDiskMaxSectorsKb = 64;
 
     if (strcmp(rec->mount_point, "auto") != 0) {
         ALOGE("Vold managed volumes must have auto mount point; ignoring %s",
@@ -122,10 +137,128 @@ dev_t DirectVolume::getShareDevice() {
 }
 
 void DirectVolume::handleVolumeShared() {
+    if(mDiskSharingCount++ == 0){
+        struct dirent *de;
+        int dfd, fd;
+        struct stat stats;
+        DIR *dir;
+        char path[256];
+        FILE *fp;
+        dev_t d;
+
+        dir = opendir("/dev/block");
+        dfd = dirfd(dir);
+        if(dfd < 0){
+            SLOGE("Failed to open dir \"/dev/block\" (%s)", strerror(errno));
+        }
+        d = getDiskDevice();
+        while((de = readdir(dir))){
+            if(de->d_name[0] == '.')
+                continue;
+            fd = openat(dfd, de->d_name, O_RDONLY);
+            if(fd < 0)
+                continue;
+            fstat(fd, &stats);
+            close(fd);
+
+            if((dev_t)stats.st_rdev == d){
+                mSavedNrRequests = -1; // in case we fail
+                if(strncmp(de->d_name, "mmcblk0", 7))
+                    sprintf(path, "/sys/block/%s/queue/nr_requests", de->d_name);
+                else
+                    sprintf(path, "/sys/block/mmcblk0/queue/nr_requests");
+                if ((fp = fopen(path, "r+"))) {
+                    char line[16];
+                    if (fgets(line, sizeof(line), fp) && sscanf(line, "%d", &mSavedNrRequests)) {
+                        fprintf(fp, "%d\n", mDiskNrRequests);
+                    } else {
+                        SLOGE("Failed to read nr_requests (%s)", strerror(errno));
+                    }
+                    fclose(fp);
+                } else {
+                    SLOGE("Failed to open %s (%s)", path, strerror(errno));
+                }
+
+                mSavedMaxSectorsKb = -1; // in case we fail
+                if(strncmp(de->d_name, "mmcblk0", 7))
+                    sprintf(path, "/sys/block/%s/queue/max_sectors_kb", de->d_name);
+                else
+                    sprintf(path, "/sys/block/mmcblk0/queue/max_sectors_kb");
+                if ((fp = fopen(path, "r+"))) {
+                    char line[16];
+                    if (fgets(line, sizeof(line), fp) && sscanf(line, "%d", &mSavedMaxSectorsKb)) {
+                        fprintf(fp, "%d\n", mDiskMaxSectorsKb);
+                    } else {
+                        SLOGE("Failed to read max_sectors_kb (%s)", strerror(errno));
+                    }
+                    fclose(fp);
+                } else {
+                    SLOGE("Failed to open %s (%s)", path, strerror(errno));
+                }
+                break;
+            }
+        }
+        closedir(dir);
+    }
     setState(Volume::State_Shared);
 }
 
 void DirectVolume::handleVolumeUnshared() {
+    if(--mDiskSharingCount == 0){
+        struct dirent *de;
+        int dfd, fd;
+        struct stat stats;
+        DIR *dir;
+        char path[256];
+        FILE *fp;
+        dev_t d;
+        dir = opendir("/dev/block");
+        dfd = dirfd(dir);
+        if(dfd < 0){
+             SLOGE("Failed to open dir \"/dev/block\" (%s)", strerror(errno));
+        }
+
+        d = getDiskDevice();
+        while((de = readdir(dir))){
+            if(de->d_name[0] == '.')
+                continue;
+            fd = openat(dfd, de->d_name, O_RDONLY);
+            if(fd < 0)
+                continue;
+            fstat(fd, &stats);
+            close(fd);
+
+            if(stats.st_rdev == d){
+                if(mSavedNrRequests == -1)
+                    break;
+                if(strncmp(de->d_name, "mmcblk0", 7))
+                    sprintf(path, "/sys/block/%s/queue/nr_requests", de->d_name);
+                else
+                    sprintf(path, "/sys/block/mmcblk0/queue/nr_requests");
+                if ((fp = fopen(path, "r+"))) {
+                    fprintf(fp, "%d\n", mSavedNrRequests);
+                    fclose(fp);
+                } else {
+                    SLOGE("Failed to open %s (%s)", path, strerror(errno));
+                }
+
+                if(mSavedMaxSectorsKb == -1)
+                    break;
+                if(strncmp(de->d_name, "mmcblk0", 7))
+                    sprintf(path, "/sys/block/%s/queue/max_sectors_kb", de->d_name);
+                else
+                    sprintf(path, "/sys/block/mmcblk0/queue/max_sectors_kb");
+                if ((fp = fopen(path, "r+"))) {
+                    fprintf(fp, "%d\n", mSavedMaxSectorsKb);
+                    fclose(fp);
+                } else {
+                    SLOGE("Failed to open %s (%s)", path, strerror(errno));
+                }
+                break;
+            }
+        }
+        closedir(dir);
+    }
     setState(Volume::State_Idle);
 }
 
@@ -143,7 +276,20 @@ int DirectVolume::handleBlockEvent(NetlinkEvent *evt) {
                 int major = atoi(evt->findParam("MAJOR"));
                 int minor = atoi(evt->findParam("MINOR"));
                 char nodepath[255];
-
+                mPartsChangeFlag = 0;
+                if (major == 179 || major == 259) {
+                    if (!strncmp(getLabel(), "sdcard", strlen("sdcard"))
+                            && (!strncmp(dp, "/devices/platform/sunxi-mmc.", strlen("/devices/platform/sunxi-mmc."))
+                            || strstr(dp, "mmc") != NULL)) {
+                        mPartsChangeFlag = 1;
+                    } else if (!strncmp(getLabel(), "extsd", strlen("extsd"))
+                            && (!strncmp(dp, "/devices/platform/sunxi-mmc.2", strlen("/devices/platform/sunxi-mmc.2"))
+                            || !strncmp(dp, "/devices/soc.0/1c11000.sdmmc/mmc_host", strlen("/devices/soc.0/1c11000.sdmmc/mmc_host")))) {
+                        mPartsChangeFlag = 2;
+                        mOemPartMajor = major;
+                        mOemPartMinor = minor;
+                    }
+                }
                 snprintf(nodepath,
                          sizeof(nodepath), "/dev/block/vold/%d:%d",
                          major, minor);
@@ -201,6 +347,8 @@ void DirectVolume::handleDiskAdded(const char * /*devpath*/,
         SLOGW("Kernel block uevent missing 'NPARTS'");
         mDiskNumParts = 1;
     }
+    SLOGD("Volume %s %s disk %d:%d added\n", getLabel(), getMountpoint(), mDiskMajor, mDiskMinor);
+    mPartsEventCnt = 0;
 
     mPendingPartCount = mDiskNumParts;
     for (int i = 0; i < MAX_PARTITIONS; i++)
@@ -226,6 +374,12 @@ void DirectVolume::handlePartitionAdded(const char *devpath, NetlinkEvent *evt) 
     int part_num;
 
     const char *tmp = evt->findParam("PARTN");
+    if (mPartsEventCnt > mDiskNumParts) {
+        SLOGW("Partition event is to much, mPartsEventCnt=%d, mDiskNumParts=%d\n", mPartsEventCnt, mDiskNumParts);
+        mPartsEventCnt = mDiskNumParts;
+    } else {
+        mPartsEventCnt++;
+    }
 
     if (tmp) {
         part_num = atoi(tmp);
@@ -293,6 +447,7 @@ void DirectVolume::handleDiskChanged(const char * /*devpath*/,
         SLOGW("Kernel block uevent missing 'NPARTS'");
         mDiskNumParts = 1;
     }
+    mPartsEventCnt = 0;
 
     mPendingPartCount = mDiskNumParts;
     for (int i = 0; i < MAX_PARTITIONS; i++)
@@ -330,6 +485,7 @@ void DirectVolume::handleDiskRemoved(const char * /*devpath*/,
              getLabel(), getFuseMountpoint(), major, minor);
     mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeDiskRemoved,
                                              msg, false);
+    Volume::unmountVol(true,true);
     setState(Volume::State_NoMedia);
 }
 
@@ -349,6 +505,10 @@ void DirectVolume::handlePartitionRemoved(const char * /*devpath*/,
      * itself
      */
     state = getState();
+    int retries = 5;
+    while (retries-- && state == Volume::State_Checking) {
+        usleep(200*1000);
+    }
     if (state != Volume::State_Mounted && state != Volume::State_Shared) {
         return;
     }
@@ -363,10 +523,12 @@ void DirectVolume::handlePartitionRemoved(const char * /*devpath*/,
             SLOGE("Failed to cleanup ASEC - unmount will probably fail!");
         }
 
+        if (!strstr(getLabel(),"usb") && !strstr(getLabel(),"extsd")) {
         snprintf(msg, sizeof(msg), "Volume %s %s bad removal (%d:%d)",
                  getLabel(), getFuseMountpoint(), major, minor);
         mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeBadRemoval,
                                              msg, false);
+        }
 
         if (Volume::unmountVol(true, false)) {
             SLOGE("Failed to unmount volume on bad removal (%s)", 
@@ -397,6 +559,7 @@ void DirectVolume::handlePartitionRemoved(const char * /*devpath*/,
 int DirectVolume::getDeviceNodes(dev_t *devs, int max) {
 
     if (mPartIdx == -1) {
+    if (!mPartsChangeFlag) {
         // If the disk has no partitions, try the disk itself
         if (!mDiskNumParts) {
             devs[0] = MKDEV(mDiskMajor, mDiskMinor);
@@ -410,6 +573,16 @@ int DirectVolume::getDeviceNodes(dev_t *devs, int max) {
             devs[i] = MKDEV(mDiskMajor, mPartMinors[i]);
         }
         return mDiskNumParts;
+    } else if (mPartsChangeFlag == 1) {
+        devs[0] = MKDEV(mDiskMajor, mPartMinors[0]);
+        return 1;
+    } else if (mPartsChangeFlag == 2) {
+        if (mOemPartMajor > 0 && mOemPartMinor > 0) {
+            devs[0] = MKDEV(mOemPartMajor, mOemPartMinor);
+            return 1;
+        }
+        return 0;
+    }
     }
     devs[0] = MKDEV(mDiskMajor, mPartMinors[mPartIdx -1]);
     return 1;

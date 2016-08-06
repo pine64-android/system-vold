@@ -47,11 +47,16 @@ public:
     static const char *ASECDIR;
     static const char *LOOPDIR;
     static const char *BLKID_PATH;
+    static const int MAX_PARTITIONS = 16;
+    static const int MAX_UNMOUNT_PARTITIONS = 256;
 
 protected:
     char* mLabel;
     char* mUuid;
     char* mUserLabel;
+    char *mMountPart[MAX_PARTITIONS];
+    char *mUnMountPart[MAX_UNMOUNT_PARTITIONS];
+    int mSharelun[MAX_PARTITIONS];
     VolumeManager *mVm;
     bool mDebug;
     int mPartIdx;
@@ -70,6 +75,8 @@ public:
     int mountVol();
     int unmountVol(bool force, bool revert);
     int formatVol(bool wipe);
+    int shareVol(int lun);
+    int unshareVol();
 
     const char* getLabel() { return mLabel; }
     const char* getUuid() { return mUuid; }
@@ -101,6 +108,7 @@ protected:
     virtual int isDecrypted(void) = 0;
 
     int createDeviceNode(const char *path, int major, int minor);
+    int deleteDeviceNode(const char *path);
 
 private:
     int initializeMbr(const char *deviceNode);
@@ -108,6 +116,13 @@ private:
     int mountAsecExternal();
     int doUnmount(const char *path, bool force);
     int extractMetadata(const char* devicePath);
+
+    char* createMountPoint(const char *path, int major, int minor);
+    int deleteMountPoint(char* mountpoint);
+    void saveUnmountPoint();
+    void deleteUnMountPoint();
+
+    int mMountedPartNum; // the partition numbers that had mounted
 };
 
 typedef android::List<Volume *> VolumeCollection;
