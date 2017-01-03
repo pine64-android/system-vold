@@ -1664,7 +1664,16 @@ static int cryptfs_restart_internal(int restart_main)
      * the tmpfs filesystem, and mount the real one.
      */
 
-    property_get("ro.crypto.fs_crypto_blkdev", crypto_blkdev, "");
+    int retries = 100;
+    while (retries--) {
+        property_get("ro.crypto.fs_crypto_blkdev", crypto_blkdev, "");
+        if (strlen(crypto_blkdev) == 0) {
+            SLOGE("fs_crypto_blkdev not set, retries=%d\n", retries);
+            usleep(100 * 1000);
+        } else {
+            break;
+        }
+    }
     if (strlen(crypto_blkdev) == 0) {
         SLOGE("fs_crypto_blkdev not set\n");
         return -1;
